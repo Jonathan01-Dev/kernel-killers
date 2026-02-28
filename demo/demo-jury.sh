@@ -18,23 +18,23 @@ OK() { echo -e "${GREEN}[✓]${RESET} $1"; }
 STEP() { echo -e "${YELLOW}[→]${RESET} $1"; }
 
 # Cleanup previous demo state
-rm -rf /tmp/archipel-demo/
-mkdir -p /tmp/archipel-demo/a /tmp/archipel-demo/b /tmp/archipel-demo/c
+rm -rf ./.demo-tmp/
+mkdir -p ./.demo-tmp/a ./.demo-tmp/b ./.demo-tmp/c
 
 # ─── STEP 1: Discovery ────────────────────────────────────────────────────────
 H "STEP 1: Starting Nodes & Peer Discovery (0:00 - 1:00)"
 STEP "Launching Alice (TCP 7777)..."
-TCP_PORT=7777 node src/node.js --cwd /tmp/archipel-demo/a > /tmp/archipel-demo/alice.log 2>&1 &
+TCP_PORT=7777 node src/node.js --cwd ./.demo-tmp/a > ./.demo-tmp/alice.log 2>&1 &
 ALICE_PID=$!
 
 sleep 1
 STEP "Launching Bob (TCP 7778)..."
-TCP_PORT=7778 node src/node.js --cwd /tmp/archipel-demo/b > /tmp/archipel-demo/bob.log 2>&1 &
+TCP_PORT=7778 node src/node.js --cwd ./.demo-tmp/b > ./.demo-tmp/bob.log 2>&1 &
 BOB_PID=$!
 
 sleep 6
 STEP "Checking UDP Multicast Discovery..."
-if grep -qi 'HELLO' /tmp/archipel-demo/alice.log || grep -qi 'peer' /tmp/archipel-demo/alice.log; then
+if grep -qi 'HELLO' ./.demo-tmp/alice.log || grep -qi 'peer' ./.demo-tmp/alice.log; then
     OK "Nodes successfully discovered each other on LAN!"
 else
     echo -e "${YELLOW}[!] Multicast log not found natively, assuming fallback/background connection${RESET}"
@@ -105,11 +105,13 @@ const { chunkFile } = require('./src/transfer/chunker');
 const { buildManifest } = require('./src/transfer/manifest');
 const id = { publicKey: require('crypto').randomBytes(32), privateKey: require('crypto').randomBytes(64) };
 
+const path = require('path');
+const demoDir = path.resolve(process.cwd(), '.demo-tmp');
 const buf = Buffer.alloc(1.2 * 1024 * 1024, 'A');
-fs.writeFileSync('/tmp/archipel-demo/test.bin', buf);
+fs.writeFileSync(path.join(demoDir, 'test.bin'), buf);
 
 (async () => {
-    const chunkInfo = await chunkFile('/tmp/archipel-demo/test.bin');
+    const chunkInfo = await chunkFile(path.join(demoDir, 'test.bin'));
     console.log(`  File mapped    : ${chunkInfo.nbChunks} chunks created (max 512KB).`);
     console.log(`  Content SHA-256: ${chunkInfo.fileId}`);
     
@@ -129,4 +131,5 @@ echo ""
 
 # ─── Cleanup ──────────────────────────────────────────────────────────────────
 kill $ALICE_PID $BOB_PID >/dev/null 2>&1 || true
+rm -rf ./.demo-tmp/
 echo -e "${BOLD}${GREEN}Archipel Demo Completed Successfully!${RESET}"
