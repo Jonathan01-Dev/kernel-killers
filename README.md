@@ -167,4 +167,7 @@ SCORE      : 100%
 ## Team — kernel-killers
 | Member | Role | Contributions |
 |--------|------|--------------|
-| **Jonathan** (`Jonathan01-Dev`) | Arch. & Dev | Protocol Specification, Cryptography, P2P Routing, CLI Integration |
+| **Emmanuel** (`Emmanuel-Prince-T`) | Arch. & Dev | Protocol Specification, Cryptography, P2P Routing, CLI Integration, Serveur TCP, Gestion connexions, BuildPacket(), parsePacket(), Lecture fichier, Découpage 512 KB, SHA256, Reconstruction fichier |
+| **Mackenzie** (`mackenzie7-dev`) | Reseau UDP & Peer Discovery | Envoi Hello, Peer table, UMP multicast Cryptography|
+| **Walid** (`agrignanwalid02-del`) | Recherches | UDP Multicast, partage de connexion, |
+| **Saoban** (`tidjanisaoban478-dot`) | Chercheur | Recherche Coding, partage de connexion, PowerPoint |

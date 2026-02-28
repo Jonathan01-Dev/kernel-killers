@@ -49,28 +49,82 @@ function timeSince(date) {
     return Math.floor(seconds / 60) + "m";
 }
 
-async function bootNode(portOpt, foreground = true) {
+async function bootNode(portOpt, foreground = true, persistent = false) {
     const { generateIdentity } = require('../crypto/identity');
     const identity = await generateIdentity();
-    // Use portOpt, or fallback to TCP_PORT env ONLY if we are starting a daemon.
-    // Otherwise rely on portOpt (which is passed as 0 for CLI commands) to get a random port
     const tcpPort = portOpt !== undefined ? portOpt : (process.env.TCP_PORT ? parseInt(process.env.TCP_PORT, 10) : 7777);
 
     const peerTable = new PeerTable();
     const tcpServer = new TcpServer(identity, peerTable, tcpPort);
-    const discovery = new Discovery(identity, peerTable, tcpPort);
+    const discovery = new Discovery(identity, peerTable, tcpPort, tcpServer);
     const downloadManager = new DownloadManager(peerTable, tcpServer, tcpServer.sessionStore, identity);
     tcpServer.downloadManager = downloadManager;
 
     const initialSharedFiles = await getSharedFiles();
-
-    // Start tcp first
     await tcpServer.start();
 
-    // Now start discovery (creates the socket)
+    const stateDir = path.join(process.cwd(), '.archipel');
+    const fsSync = require('fs');
+    if (!fsSync.existsSync(stateDir)) fsSync.mkdirSync(stateDir, { recursive: true });
+
+    const writeAtomic = (filePath, data) => {
+        const tmpPath = filePath + '.tmp';
+        try {
+            fsSync.writeFileSync(tmpPath, data);
+            fsSync.renameSync(tmpPath, filePath);
+        } catch (_) { }
+    };
+
+    const countChunks = async () => {
+        let count = 0;
+        try {
+            const chunksDir = path.join(stateDir, 'chunks');
+            const fileDirs = await fs.readdir(chunksDir);
+            for (const fId of fileDirs) {
+                const fPath = path.join(chunksDir, fId);
+                const stat = await fs.stat(fPath);
+                if (stat.isDirectory()) {
+                    const files = await fs.readdir(fPath);
+                    count += files.filter(f => f.endsWith('.chunk')).length;
+                }
+            }
+        } catch (_) { }
+        return count;
+    };
+
+    const writePeerState = () => {
+        if (!persistent) return;
+        const peers = peerTable.getAll().map(p => ({
+            nodeId: p.nodeId.toString('hex'),
+            ip: p.ip,
+            tcpPort: p.tcpPort,
+            lastSeen: p.lastSeen,
+            reputation: p.reputation,
+            sharedFiles: p.sharedFiles || []
+        }));
+        writeAtomic(path.join(stateDir, 'peers.json'), JSON.stringify(peers, null, 2));
+    };
+
+    const writeStatus = async () => {
+        if (!persistent) return;
+        const status = {
+            nodeId: identity.publicKey.toString('hex'),
+            tcpPort: tcpPort,
+            uptime: process.uptime(),
+            peersCount: peerTable.getAll().length,
+            filesShared: (await getSharedFiles()).length,
+            chunksStored: await countChunks()
+        };
+        writeAtomic(path.join(stateDir, 'status.json'), JSON.stringify(status, null, 2));
+    };
+
+    if (persistent) {
+        setInterval(writePeerState, 10000);
+        setInterval(writeStatus, 10000);
+    }
+
     discovery.start();
 
-    const _originalSendHello = discovery._sendHello.bind(discovery);
     discovery._sendHello = () => {
         if (!discovery.socket) return;
         const payload = Buffer.from(JSON.stringify({
@@ -80,6 +134,10 @@ async function bootNode(portOpt, foreground = true) {
         }));
         const pktStr = buildPacket(PACKET_TYPES.HELLO, identity.publicKey, payload);
         discovery.socket.send(pktStr, 6000, '239.255.42.99', () => { });
+        try {
+            discovery.socket.setBroadcast(true);
+            discovery.socket.send(pktStr, 6000, '255.255.255.255', () => { });
+        } catch (_) { }
     };
 
     discovery.socket.on('message', (msg, rinfo) => {
@@ -95,6 +153,7 @@ async function bootNode(portOpt, foreground = true) {
                     tcpPort: p.tcpPort,
                     sharedFiles: p.sharedFiles || []
                 });
+                if (persistent) writePeerState();
             }
         } catch (e) { }
     });
@@ -108,7 +167,7 @@ async function bootNode(portOpt, foreground = true) {
                 sharedFiles: p.sharedFiles || []
             }));
             const pktBytes = buildPacket(PACKET_TYPES.PEER_LIST, identity.publicKey, Buffer.from(JSON.stringify(peers)));
-            await tcpServer.sendToPeer(peer.ip, peer.tcpPort, pktBytes);
+            await tcpServer.sendToPeer(peer.ip, peer.tcpPort, pktBytes, peer.nodeId);
         } catch (err) { }
     });
 
@@ -138,7 +197,7 @@ async function run() {
     if (command === 'start') {
         const portIndex = args.indexOf('--port');
         const port = portIndex > -1 ? parseInt(args[portIndex + 1], 10) : undefined;
-        await bootNode(port, true);
+        await bootNode(port, true, true);
 
         const { PACKET_TYPES, parsePacket } = require('../network/packet');
         const conversationHistory = [];
@@ -186,25 +245,96 @@ async function run() {
     // connect to multicast quickly, do action, exit.
     // OR we just assume they run `archipel peers` and don't care that it takes 1s to discover peers again.
 
-    console.log("[CLI] Initializing node...");
-    await bootNode(0, false); // Random TCP port, background
-    const node = global.archipelNode;
-
-    // Give it 2 seconds to discover peers on LAN
-    await new Promise(r => setTimeout(r, 2000));
-
     if (command === 'peers') {
-        const peers = node.peerTable.getAll();
-        console.log('ID (8 chars) | IP | TCP Port | Last Seen | Reputation | Files');
-        console.log('-'.repeat(60));
+        const peersFile = path.join(process.cwd(), '.archipel', 'peers.json');
+        const fsSync = require('fs');
+        if (!fsSync.existsSync(peersFile)) {
+            console.log('No node running or no peers discovered yet.');
+            console.log('Start a node first: node src/cli/commands.js start --port 7777');
+            process.exit(0);
+        }
+        let peers;
+        try {
+            peers = JSON.parse(fsSync.readFileSync(peersFile, 'utf8'));
+        } catch (err) {
+            console.log('Error reading peers state. It might be being updated. Please try again.');
+            process.exit(1);
+        }
+        if (peers.length === 0) {
+            console.log('Node is running but no peers discovered yet.');
+            process.exit(0);
+        }
+        console.log('ID (8 chars) | IP              | TCP Port | Last Seen      | Rep  | Files');
+        console.log('-'.repeat(75));
         peers.forEach(p => {
-            const shortId = p.nodeId.toString('hex').substring(0, 8);
-            const seen = timeSince(p.lastSeen);
-            const fCount = (p.sharedFiles || []).length;
-            console.log(`${shortId} | ${p.ip} | ${p.tcpPort} | ${seen} ago | ${p.reputation.toFixed(1)} | ${fCount}`);
+            const ago = Math.round((Date.now() - p.lastSeen) / 1000);
+            const files = p.sharedFiles.length;
+            console.log(
+                `${p.nodeId.slice(0, 8)} | ${p.ip.padEnd(15)} | ${String(p.tcpPort).padEnd(8)} | ${ago}s ago${' '.repeat(8)} | ${p.reputation.toFixed(1)} | ${files}`
+            );
         });
         process.exit(0);
     }
+
+    if (command === 'status') {
+        const statusFile = path.join(process.cwd(), '.archipel', 'status.json');
+        const fsSync = require('fs');
+        if (!fsSync.existsSync(statusFile)) {
+            console.log('No node running. Start a node first: node src/cli/commands.js start');
+            process.exit(0);
+        }
+        let s;
+        try {
+            s = JSON.parse(fsSync.readFileSync(statusFile, 'utf8'));
+        } catch (err) {
+            console.log('Error reading status state. Please try again.');
+            process.exit(1);
+        }
+        const hr = Math.floor(s.uptime / 3600);
+        const min = Math.floor((s.uptime % 3600) / 60);
+        const sec = Math.floor(s.uptime % 60);
+
+        console.log(`NodeID: ${s.nodeId.substring(0, 16)}`);
+        console.log(`TCP Port: ${s.tcpPort}`);
+        console.log(`Peers connected: ${s.peersCount}`);
+        console.log(`Files shared: ${s.filesShared}`);
+        console.log(`Chunks stored: ${s.chunksStored}`);
+        console.log(`Uptime: ${hr}:${min.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`);
+        process.exit(0);
+    }
+
+    if (command === 'receive') {
+        const manDir = path.join(process.cwd(), '.archipel', 'manifests');
+        const fsSync = require('fs');
+        try {
+            if (!fsSync.existsSync(manDir)) {
+                console.log('No manifests received yet.');
+                process.exit(0);
+            }
+            const files = fsSync.readdirSync(manDir);
+            console.log('fileId (8chars) | filename | size | sender | chunks local/total');
+            console.log('-'.repeat(70));
+            for (const file of files) {
+                const doc = JSON.parse(fsSync.readFileSync(path.join(manDir, file), 'utf8'));
+                const chunksDir = path.join(process.cwd(), '.archipel', 'chunks', doc.file_id);
+                let localCount = 0;
+                if (fsSync.existsSync(chunksDir)) {
+                    localCount = fsSync.readdirSync(chunksDir).filter(f => f.endsWith('.chunk')).length;
+                }
+                console.log(`${doc.file_id.substring(0, 8)} | ${doc.filename} | ${doc.size} | ${doc.sender_id.substring(0, 8)} | ${localCount}/${doc.nb_chunks}`);
+            }
+        } catch (err) {
+            console.error(`Error reading manifests: ${err.message}`);
+        }
+        process.exit(0);
+    }
+
+    console.log("[CLI] Initializing ghost node for network command...");
+    await bootNode(0, false, false); // Random TCP port, background, NOT persistent
+    const node = global.archipelNode;
+
+    // Give it 2 seconds to discover peers on LAN (broadcast/multicast)
+    await new Promise(r => setTimeout(r, 2000));
 
     if (command === 'msg') {
         const targetHex = args[1];
@@ -218,7 +348,7 @@ async function run() {
 
         // Wait handshake to finish
         try {
-            await node.tcpServer.sendToPeer(targetPeer.ip, targetPeer.tcpPort, Buffer.from(JSON.stringify({ type: PACKET_TYPES.MSG, payload: Buffer.from(msgText) })));
+            await node.tcpServer.sendToPeer(targetPeer.ip, targetPeer.tcpPort, Buffer.from(JSON.stringify({ type: PACKET_TYPES.MSG, payload: Buffer.from(msgText) })), targetPeer.nodeId);
             console.log(`[SENT] message to ${targetPeer.nodeId.toString('hex').substring(0, 8)}`);
         } catch (err) {
             console.log(`[ERROR] Send message failed: ${err.message}`);
@@ -244,7 +374,7 @@ async function run() {
         const encoded = encodeManifest(manifest);
 
         // Send manifest
-        await node.tcpServer.sendToPeer(targetPeer.ip, targetPeer.tcpPort, Buffer.from(JSON.stringify({ type: PACKET_TYPES.MANIFEST, payload: encoded })));
+        await node.tcpServer.sendToPeer(targetPeer.ip, targetPeer.tcpPort, Buffer.from(JSON.stringify({ type: PACKET_TYPES.MANIFEST, payload: encoded })), targetPeer.nodeId);
 
         // Just simulating sending proactively visually as requested
         for (let i = 1; i <= manifest.nb_chunks; i++) {
@@ -287,40 +417,6 @@ async function run() {
             clearInterval(pollChunks);
             console.error(`\n[ERROR] Download failed: ${err.message}`);
         }
-        process.exit(0);
-    }
-
-    if (command === 'receive') {
-        const manDir = path.join(process.cwd(), '.archipel', 'manifests');
-        try {
-            const files = await fs.readdir(manDir);
-            console.log('fileId (8chars) | filename | size | sender | chunks local/total');
-            console.log('-'.repeat(70));
-            for (const file of files) {
-                const doc = JSON.parse(await fs.readFile(path.join(manDir, file), 'utf8'));
-                const localCount = (await listLocalChunks(doc.file_id)).length;
-                console.log(`${doc.file_id.substring(0, 8)} | ${doc.filename} | ${doc.size} | ${doc.sender_id.substring(0, 8)} | ${localCount}/${doc.nb_chunks}`);
-            }
-        } catch (err) {
-            if (err.code !== 'ENOENT') throw err;
-        }
-        process.exit(0);
-    }
-
-    if (command === 'status') {
-        const peersCnt = node.peerTable.getAll().length;
-        const uptime = require('process').uptime();
-        const hr = Math.floor(uptime / 3600);
-        const min = Math.floor((uptime % 3600) / 60);
-        const sec = Math.floor(uptime % 60);
-        const sharedCnt = (await getSharedFiles()).length;
-
-        console.log(`NodeID: ${node.identity.publicKey.toString('hex').substring(0, 16)}`);
-        console.log(`TCP Port: ${node.tcpServer.port}`);
-        console.log(`Peers connected: ${peersCnt}`);
-        console.log(`Files shared: ${sharedCnt}`);
-        console.log(`Chunks stored: -`); // Can't easily count recursively synchronously without overhead
-        console.log(`Uptime: ${hr}:${min.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`);
         process.exit(0);
     }
 

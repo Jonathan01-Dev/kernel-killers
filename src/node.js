@@ -49,7 +49,7 @@ async function main() {
 
     const peerTable = new PeerTable();
     const tcpServer = new TcpServer(identity, peerTable, tcpPort);
-    const discovery = new Discovery(identity, peerTable, tcpPort);
+    const discovery = new Discovery(identity, peerTable, tcpPort, tcpServer);
 
     const downloadManager = new DownloadManager(peerTable, tcpServer, tcpServer.sessionStore, identity);
     tcpServer.downloadManager = downloadManager;
@@ -58,6 +58,60 @@ async function main() {
 
     // Start TCP before touching discovery (discovery.socket is null until start())
     await tcpServer.start();
+
+    // IPC State Persistence
+    const stateDir = path.join(process.cwd(), '.archipel');
+    const fsSync = require('fs');
+    if (!fsSync.existsSync(stateDir)) fsSync.mkdirSync(stateDir, { recursive: true });
+
+    const writeAtomic = (filePath, data) => {
+        const tmpPath = filePath + '.tmp';
+        try {
+            fsSync.writeFileSync(tmpPath, data);
+            fsSync.renameSync(tmpPath, filePath);
+        } catch (_) { }
+    };
+
+    const countChunks = async () => {
+        let count = 0;
+        try {
+            const chunksDir = path.join(stateDir, 'chunks');
+            const fileDirs = await fs.readdir(chunksDir);
+            for (const fId of fileDirs) {
+                const subDir = path.join(chunksDir, fId);
+                const files = await fs.readdir(subDir);
+                count += files.filter(f => f.endsWith('.chunk')).length;
+            }
+        } catch (_) { }
+        return count;
+    };
+
+    const writePeerState = () => {
+        const peers = peerTable.getAll().map(p => ({
+            nodeId: p.nodeId.toString('hex'),
+            ip: p.ip,
+            tcpPort: p.tcpPort,
+            lastSeen: p.lastSeen,
+            reputation: p.reputation,
+            sharedFiles: p.sharedFiles || []
+        }));
+        writeAtomic(path.join(stateDir, 'peers.json'), JSON.stringify(peers, null, 2));
+    };
+
+    const writeStatus = async () => {
+        const status = {
+            nodeId: identity.publicKey.toString('hex'),
+            tcpPort: tcpPort,
+            uptime: process.uptime(),
+            peersCount: peerTable.getAll().length,
+            filesShared: (await getSharedFiles()).length,
+            chunksStored: await countChunks()
+        };
+        writeAtomic(path.join(stateDir, 'status.json'), JSON.stringify(status, null, 2));
+    };
+
+    setInterval(writePeerState, 10000);
+    setInterval(writeStatus, 10000);
 
     // Patch _sendHello to include sharedFiles in HELLO payload
     discovery._sendHello = () => {
@@ -73,9 +127,8 @@ async function main() {
         });
     };
 
-    discovery.start(); // socket is created here — safe to attach listeners after this
+    discovery.start();
 
-    // Enrich peer entries when we receive sharedFiles in HELLO
     discovery.socket.on('message', (msg, rinfo) => {
         try {
             if (!verifyHMAC(msg)) return;
@@ -88,6 +141,7 @@ async function main() {
                     tcpPort: p.tcpPort,
                     sharedFiles: p.sharedFiles || [],
                 });
+                writePeerState();
             }
         } catch (_) { }
     });
@@ -103,7 +157,7 @@ async function main() {
             }));
             const pkt = buildPacket(PACKET_TYPES.PEER_LIST, identity.publicKey,
                 Buffer.from(JSON.stringify(peers)));
-            await tcpServer.sendToPeer(peer.ip, peer.tcpPort, pkt);
+            await tcpServer.sendToPeer(peer.ip, peer.tcpPort, pkt, peer.nodeId);
         } catch (_) { }
     });
 

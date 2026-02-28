@@ -8,10 +8,11 @@ const MULTICAST_ADDR = '239.255.42.99';
 const MULTICAST_PORT = 6000;
 
 class Discovery {
-    constructor(identity, peerTable, tcpPort) {
+    constructor(identity, peerTable, tcpPort, tcpServer) {
         this.identity = identity;
         this.peerTable = peerTable;
         this.tcpPort = tcpPort;
+        this.tcpServer = tcpServer;
         this.socket = null;
         this.interval = null;
     }
@@ -75,6 +76,16 @@ class Discovery {
 
             if (pkt.type === PACKET_TYPES.HELLO) {
                 const data = JSON.parse(pkt.payload.toString('utf8'));
+
+                if (this.tcpServer && (this.tcpServer.isConnected(pkt.nodeId) || this.tcpServer.isConnecting(pkt.nodeId))) {
+                    // Already connected or handshake in progress — just update lastSeen
+                    this.peerTable.upsert(pkt.nodeId, {
+                        ip: rinfo.address,
+                        tcpPort: data.tcpPort,
+                    });
+                    return;
+                }
+
                 this.peerTable.upsert(pkt.nodeId, {
                     ip: rinfo.address,
                     tcpPort: data.tcpPort,

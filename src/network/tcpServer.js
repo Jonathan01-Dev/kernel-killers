@@ -19,6 +19,7 @@ class TcpServer {
         this.sessionStore = new SessionStore();
         this.tofuStore = new TofuStore();
         this.peerSockets = new Map();
+        this.pendingConnections = new Set();
         this.downloadManager = null; // injected later
     }
 
@@ -71,34 +72,60 @@ class TcpServer {
         this._writeFrame(socket, pkt);
     }
 
-    async sendToPeer(ip, port, packetBuffer) {
-        return new Promise((resolve, reject) => {
-            const socket = new net.Socket();
-            socket.connectingTimeout = setTimeout(() => {
-                socket.destroy();
-                reject(new Error('Connection timeout'));
-            }, 5000);
+    isConnected(nodeId) {
+        if (!nodeId) return false;
+        const sock = this.peerSockets.get(nodeId.toString('hex'));
+        return sock && !sock.destroyed;
+    }
 
-            socket.on('error', (err) => {
-                clearTimeout(socket.connectingTimeout);
-                socket.destroy();
-                reject(err);
-            });
+    isConnecting(nodeId) {
+        if (!nodeId) return false;
+        return this.pendingConnections.has(nodeId.toString('hex'));
+    }
 
-            socket.connect(port, ip, () => {
-                clearTimeout(socket.connectingTimeout);
-                this._handleConnection(socket, true)
-                    .then(() => {
-                        const pkt = parsePacket(packetBuffer);
-                        return this.sendToSocket(socket, pkt.type, pkt.payload);
-                    })
-                    .then(resolve)
-                    .catch(err => {
-                        socket.destroy();
-                        reject(err);
-                    });
+    async sendToPeer(ip, port, packetBuffer, nodeId = null) {
+        const nodeIdHex = nodeId ? nodeId.toString('hex') : null;
+        if (nodeIdHex) {
+            if (this.isConnected(nodeId)) {
+                const socket = this.peerSockets.get(nodeIdHex);
+                const pkt = parsePacket(packetBuffer);
+                return this.sendToSocket(socket, pkt.type, pkt.payload);
+            }
+            if (this.pendingConnections.has(nodeIdHex)) return;
+            this.pendingConnections.add(nodeIdHex);
+        }
+
+        try {
+            return await new Promise((resolve, reject) => {
+                const socket = new net.Socket();
+                socket.connectingTimeout = setTimeout(() => {
+                    socket.destroy();
+                    reject(new Error('Connection timeout'));
+                }, 5000);
+
+                socket.on('error', (err) => {
+                    clearTimeout(socket.connectingTimeout);
+                    socket.destroy();
+                    reject(err);
+                });
+
+                socket.connect(port, ip, () => {
+                    clearTimeout(socket.connectingTimeout);
+                    this._handleConnection(socket, true)
+                        .then(() => {
+                            const pkt = parsePacket(packetBuffer);
+                            return this.sendToSocket(socket, pkt.type, pkt.payload);
+                        })
+                        .then(resolve)
+                        .catch(err => {
+                            socket.destroy();
+                            reject(err);
+                        });
+                });
             });
-        });
+        } finally {
+            if (nodeIdHex) this.pendingConnections.delete(nodeIdHex);
+        }
     }
 
     async _handleConnection(socket, isOutbound) {
@@ -119,21 +146,31 @@ class TcpServer {
         }
 
         const { sessionKey, peerNodeId } = sessionContext;
+        const peerIdHex = peerNodeId.toString('hex');
         socket.peerNodeId = peerNodeId;
+
+        // Prevent redundant connections once identified
+        if (this.peerSockets.has(peerIdHex)) {
+            const existing = this.peerSockets.get(peerIdHex);
+            if (!existing.destroyed) {
+                socket.destroy();
+                return;
+            }
+        }
 
         const trustStatus = this.tofuStore.check(peerNodeId, peerNodeId);
         if (trustStatus === 'CONFLICT') {
-            console.warn(`[TCP] TOFU CONFLICT with ${peerNodeId.toString('hex')}. Closing socket.`);
+            console.warn(`[TCP] TOFU CONFLICT with ${peerIdHex}. Closing socket.`);
             socket.destroy();
             throw new Error('TOFU CONFLICT');
         } else if (trustStatus === 'NEW') {
             this.tofuStore.trust(peerNodeId, peerNodeId);
-            console.log(`[TOFU] trusted new peer ${peerNodeId.toString('hex').substring(0, 8)}`);
+            console.log(`[TOFU] trusted new peer ${peerIdHex.substring(0, 8)}`);
         }
 
         this.sessionStore.set(peerNodeId, sessionKey);
-        this.peerSockets.set(peerNodeId.toString('hex'), socket);
-        console.log(`[HANDSHAKE] complete with ${peerNodeId.toString('hex').substring(0, 8)}`);
+        this.peerSockets.set(peerIdHex, socket);
+        console.log(`[HANDSHAKE] complete with ${peerIdHex.substring(0, 8)}`);
 
         let buffer = Buffer.alloc(0);
         let expectedLength = -1;
