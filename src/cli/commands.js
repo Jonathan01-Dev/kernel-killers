@@ -50,8 +50,11 @@ function timeSince(date) {
 }
 
 async function bootNode(portOpt, foreground = true) {
-    const identity = loadIdentity();
-    const tcpPort = portOpt || (process.env.TCP_PORT ? parseInt(process.env.TCP_PORT, 10) : 7777);
+    const { generateIdentity } = require('../crypto/identity');
+    const identity = await generateIdentity();
+    // Use portOpt, or fallback to TCP_PORT env ONLY if we are starting a daemon.
+    // Otherwise rely on portOpt (which is passed as 0 for CLI commands) to get a random port
+    const tcpPort = portOpt !== undefined ? portOpt : (process.env.TCP_PORT ? parseInt(process.env.TCP_PORT, 10) : 7777);
 
     const peerTable = new PeerTable();
     const tcpServer = new TcpServer(identity, peerTable, tcpPort);
@@ -61,14 +64,21 @@ async function bootNode(portOpt, foreground = true) {
 
     const initialSharedFiles = await getSharedFiles();
 
+    // Start tcp first
+    await tcpServer.start();
+
+    // Now start discovery (creates the socket)
+    discovery.start();
+
     const _originalSendHello = discovery._sendHello.bind(discovery);
     discovery._sendHello = () => {
+        if (!discovery.socket) return;
         const payload = Buffer.from(JSON.stringify({
             tcpPort: tcpPort,
             timestamp: Date.now(),
             sharedFiles: initialSharedFiles
         }));
-        const pktStr = buildPacket(PACKET_TYPES.HELLO, identity.publicKey, payload, identity.privateKey);
+        const pktStr = buildPacket(PACKET_TYPES.HELLO, identity.publicKey, payload);
         discovery.socket.send(pktStr, 6000, '239.255.42.99', () => { });
     };
 
@@ -97,12 +107,10 @@ async function bootNode(portOpt, foreground = true) {
                 tcpPort: p.tcpPort,
                 sharedFiles: p.sharedFiles || []
             }));
-            await tcpServer.sendToPeer(peer.ip, peer.tcpPort, Buffer.from(JSON.stringify({ type: PACKET_TYPES.PEER_LIST, payload: Buffer.from(JSON.stringify(peers)) })));
+            const pktBytes = buildPacket(PACKET_TYPES.PEER_LIST, identity.publicKey, Buffer.from(JSON.stringify(peers)));
+            await tcpServer.sendToPeer(peer.ip, peer.tcpPort, pktBytes);
         } catch (err) { }
     });
-
-    await tcpServer.start();
-    discovery.start();
 
     global.archipelNode = { identity, peerTable, tcpServer, discovery, downloadManager, startTime: Date.now() };
 
