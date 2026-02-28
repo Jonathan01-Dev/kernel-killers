@@ -54,9 +54,17 @@ class Discovery {
         }));
 
         const pkt = buildPacket(PACKET_TYPES.HELLO, this.identity.publicKey, payload);
+
+        // 1. Send via Multicast (Cleanest, works on real switches)
         this.socket.send(pkt, MULTICAST_PORT, MULTICAST_ADDR, (err) => {
             if (err) console.error('[DISCOVERY] send error:', err.message);
         });
+
+        // 2. Send via Global Broadcast (Fallback for Windows Mobile Hotspot and Android AP isolation)
+        try {
+            this.socket.setBroadcast(true);
+            this.socket.send(pkt, MULTICAST_PORT, '255.255.255.255', () => { });
+        } catch (_) { }
     }
 
     _onMessage(msg, rinfo) {
